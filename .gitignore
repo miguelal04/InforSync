@@ -1,0 +1,4 @@
+.env
+.vscode
+sync.log
+__pycache__/ *.log
