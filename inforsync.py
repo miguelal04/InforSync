@@ -1,12 +1,17 @@
-import requests
 import os
-from icalendar import Calendar
-from datetime import datetime, date
-from dateutil.parser import isoparse
-from dotenv import load_dotenv
-import unicodedata
+import sys
 import time
 import logging
+import unicodedata
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import requests
+from dateutil.parser import isoparse
+from dotenv import load_dotenv
+from icalendar import Calendar
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 
 # --- Configurações ---
@@ -16,246 +21,388 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("DATABASE_ID")
 ICAL_URL = os.getenv("ICAL_URL")
 
+PROJECT_NAME = "Inforestudante"
+TZ_NAME = "Europe/Lisbon"
+TZ = ZoneInfo(TZ_NAME)
+WRITE_DELAY = 0.35  # Notion aceita ~3 pedidos/s
+
 headers = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28"
+    "Notion-Version": "2022-06-28",
 }
 
-
-# --- Configuração de Logging ---
-
-log_file = os.path.join(os.path.dirname(__file__), "sync.log")
+log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync.log")
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(log_file, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(log_file, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
 
 # --- Funções auxiliares ---
 
-def normalize_datetime(dt):     # Converte para datetime sem timezone, truncando segundos e microssegundos
-    if isinstance(dt, datetime):
-        return dt.replace(tzinfo=None, second=0, microsecond=0)
-    elif isinstance(dt, date):
-        return datetime.combine(dt, datetime.min.time())
-    return dt
-
-def normalize_text(text):       # Remove acentos e converte para minúsculas
-    text = unicodedata.normalize('NFD', text)
-    text = text.encode('ascii', 'ignore').decode('utf-8')
+def normalize_text(text):
+    """Remove acentos e converte para minúsculas."""
+    text = unicodedata.normalize("NFD", text)
+    text = text.encode("ascii", "ignore").decode("utf-8")
     return text.lower().strip()
 
-def determine_types(title):     # Determina os tipos do evento baseado no título
+
+def fmt_dt(dt):
+    """Converte date/datetime do ICS para string canónica (hora de Lisboa, sem offset)."""
+    if isinstance(dt, datetime):
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(TZ)
+        return dt.replace(tzinfo=None, second=0, microsecond=0).isoformat(timespec="seconds")
+    return dt.isoformat()  # date (dia inteiro): YYYY-MM-DD
+
+
+def parse_notion_date(value):
+    """Converte a data devolvida pelo Notion para a mesma string canónica."""
+    if not value:
+        return None
+    if len(value) == 10:  # dia inteiro
+        return value
+    return fmt_dt(isoparse(value))
+
+
+def determine_types(title):
+    """Determina os tipos do evento com base no título."""
     types = []
-    title_norm = normalize_text(title)
-    if "avaliacao" in title_norm or "defesa de trabalhos" in title_norm or "entrega" in title_norm or "(ee)" in title_norm:
-        if "defesa de trabalhos" in title_norm:
+    t = normalize_text(title)
+    if "avaliacao" in t or "defesa de trabalhos" in t or "entrega" in t or "(ee)" in t:
+        if "defesa de trabalhos" in t:
             types.append("Avaliação")
-        elif "entrega" in title_norm:
+        elif "entrega" in t:
             types.append("Avaliação")
-        elif "(ee)" in title_norm:
+        elif "(ee)" in t:
             types.append("Época Especial")
-        elif "frequencia" in title_norm:
+        elif "frequencia" in t:
             types.append("Frequência")
-        elif "(er)" in title_norm:
+        elif "(er)" in t:
             types.append("Exame Recurso")
-        elif "(en)" in title_norm:
+        elif "(en)" in t:
             types.append("Exame Normal")
         else:
             types.append("Avaliação")
-        if "por inscrever" in title_norm:
+        if "por inscrever" in t:
             types.append("Por inscrever")
     else:
         types.append("Aula")
     return types
 
-def types_changed(existing_types, new_types):
-    return set(map(str.lower, existing_types)) != set(map(str.lower, new_types))
 
-def dates_changed(existing_start, existing_end, new_start, new_end):
-    return existing_start != new_start or existing_end != new_end
+def same_types(a, b):
+    return {x.lower() for x in a} == {x.lower() for x in b}
+
+
+def needs_update(page, ev):
+    return (
+        page["title"] != ev["title"]
+        or page["start"] != ev["start"]
+        or page["end"] != ev["end"]
+        or not same_types(page["types"], ev["types"])
+        or page["uid"] != ev["uid"]
+    )
 
 
 # --- Notion API ---
 
-def get_existing_events():
-    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
-    events = {}
-    has_more = True
-    next_cursor = None
-    while has_more:
-        payload = {"page_size": 100}
-        if next_cursor:
-            payload["start_cursor"] = next_cursor
+def notion_request(method, url, **kwargs):
+    """Pedido com retry para 429/5xx. Levanta exceção se falhar de vez."""
+    last_error = None
+    for attempt in range(6):
         try:
-            response = requests.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
+            r = requests.request(method, url, headers=headers, timeout=30, **kwargs)
         except requests.RequestException as e:
-            print(f"ALERTA - Erro ao recuperar eventos: {e}")
-            break
+            last_error = e
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 429:
+            time.sleep(int(r.headers.get("Retry-After", 1)))
+            continue
+        if r.status_code >= 500:
+            last_error = f"HTTP {r.status_code}"
+            time.sleep(2 ** attempt)
+            continue
+        r.raise_for_status()
+        return r
+    raise RuntimeError(f"Notion falhou após várias tentativas: {last_error}")
+
+
+def date_payload(start, end):
+    return {
+        "start": start,
+        "end": end,
+        "time_zone": TZ_NAME if "T" in start else None,
+    }
+
+
+def check_schema():
+    """Confirma que a base de dados tem as propriedades que o script usa."""
+    data = notion_request("GET", f"https://api.notion.com/v1/databases/{DATABASE_ID}").json()
+    props = data["properties"]
+    expected = {
+        "Nome": "title",
+        "Date": "date",
+        "Project": "select",
+        "Type": "multi_select",
+        "UID": "rich_text",
+    }
+    problems = []
+    for name, ptype in expected.items():
+        if name not in props:
+            problems.append(f"falta a propriedade '{name}' (tipo {ptype})")
+        elif props[name]["type"] != ptype:
+            problems.append(f"'{name}' devia ser do tipo {ptype}, mas é {props[name]['type']}")
+    if problems:
+        raise RuntimeError(
+            "; ".join(problems) + f". Propriedades existentes: {', '.join(props.keys())}"
+        )
+
+
+def get_existing_events():
+    """
+    Devolve lista de todas as páginas do projeto. Se a leitura falhar,
+    a exceção propaga-se e o script aborta (nunca segue com dados parciais).
+    """
+    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+    pages = []
+    cursor = None
+    while True:
+        payload = {
+            "page_size": 100,
+            "filter": {"property": "Project", "select": {"equals": PROJECT_NAME}},
+        }
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = notion_request("POST", url, json=payload).json()
+
         for page in data["results"]:
-            try:
-                project = page["properties"]["Project"]["select"]["name"] if page["properties"]["Project"]["select"] else ""
-                if project != "Inforestudante":
-                    continue
-                title = page["properties"]["Nome"]["title"][0]["text"]["content"] if page["properties"]["Nome"]["title"] else ""
-                date_info = page["properties"]["Date"]["date"]
-                start = isoparse(date_info["start"]) if date_info and date_info.get("start") else None
-                end = isoparse(date_info["end"]) if date_info and date_info.get("end") else None
-                types = [t["name"] for t in page["properties"]["Type"]["multi_select"]]
-                # Chave simplificada (ignora microssegundos/timezone)
-                key = f"{normalize_text(title)}__{normalize_datetime(start)}__{normalize_datetime(end)}"
-                events[key] = {
-                    "page_id": page["id"],
-                    "title": title,
-                    "start": normalize_datetime(start),
-                    "end": normalize_datetime(end),
-                    "types": types
-                }
-            except (KeyError, IndexError, TypeError):
-                continue
-        has_more = data.get("has_more", False)
-        next_cursor = data.get("next_cursor", None)
-    return events
+            props = page["properties"]
+            title = "".join(t["plain_text"] for t in props["Nome"]["title"])
+            date_info = props["Date"]["date"] or {}
+            uid = "".join(t["plain_text"] for t in props["UID"]["rich_text"]).strip()
+            pages.append({
+                "page_id": page["id"],
+                "title": title,
+                "start": parse_notion_date(date_info.get("start")),
+                "end": parse_notion_date(date_info.get("end")),
+                "types": [t["name"] for t in props["Type"]["multi_select"]],
+                "uid": uid,
+            })
 
-def add_event(title, start, end, types):
-    url = "https://api.notion.com/v1/pages"
-    multi_select_types = [{"name": t} for t in types]
-    data = {
+        logger.info(f"Notion: {len(pages)} páginas lidas...")
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return pages
+
+
+def build_properties(ev, include_project=False):
+    props = {
+        "Nome": {"title": [{"text": {"content": ev["title"]}}]},
+        "Date": {"date": date_payload(ev["start"], ev["end"])},
+        "Type": {"multi_select": [{"name": t} for t in ev["types"]]},
+        "UID": {"rich_text": [{"text": {"content": ev["uid"]}}]},
+    }
+    if include_project:
+        props["Project"] = {"select": {"name": PROJECT_NAME}}
+    return props
+
+
+def add_event(ev):
+    body = {
         "parent": {"database_id": DATABASE_ID},
-        "properties": {
-            "Nome": {"title": [{"text": {"content": title}}]},
-            "Date": {"date": {"start": start.isoformat(), "end": end.isoformat() if end else None}},
-            "Project": {"select": {"name": "Inforestudante"}},
-            "Type": {"multi_select": multi_select_types}
-        }
+        "properties": build_properties(ev, include_project=True),
     }
     try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
+        notion_request("POST", "https://api.notion.com/v1/pages", json=body)
         return True
-    except requests.RequestException as e:
-        print(f"ALERTA - Erro ao criar evento: {e}")
+    except Exception as e:
+        logger.error(f"Erro ao criar '{ev['title']}': {e}")
         return False
 
-def update_event(page_id, title, old_start, old_end, old_types, new_start, new_end, new_types):
-    url = f"https://api.notion.com/v1/pages/{page_id}"
-    multi_select_types = [{"name": t} for t in new_types]
-    data = {
-        "properties": {
-            "Date": {"date": {"start": new_start.isoformat(), "end": new_end.isoformat() if new_end else None}},
-            "Type": {"multi_select": multi_select_types}
+
+def update_event(page_id, ev):
+    body = {"properties": build_properties(ev)}
+    try:
+        notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json=body)
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao atualizar '{ev['title']}': {e}")
+        return False
+
+
+def archive_event(page_id, title):
+    try:
+        notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", json={"archived": True})
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao arquivar '{title}': {e}")
+        return False
+
+
+# --- ICS ---
+
+def load_ics_events():
+    r = requests.get(ICAL_URL, timeout=30)
+    r.raise_for_status()
+    cal = Calendar.from_ical(r.content)
+
+    events = {}
+    for comp in cal.walk("VEVENT"):
+        title = str(comp.get("summary", "")).strip()
+        uid = str(comp.get("uid", "")).strip()
+        rec = comp.get("recurrence-id")
+        if rec is not None:
+            uid = f"{uid}#{fmt_dt(rec.dt)}"
+        if not uid:
+            # Sem UID: cria um identificador estável a partir de título + início
+            uid = f"noid-{normalize_text(title)}-{fmt_dt(comp.get('dtstart').dt)}"
+
+        s = comp.get("dtstart").dt
+        e_prop = comp.get("dtend")
+        e = e_prop.dt if e_prop is not None else None
+        if e is not None and not isinstance(e, datetime):
+            e = e - timedelta(days=1)  # DTEND de dia inteiro é exclusivo no ICS
+
+        start = fmt_dt(s)
+        end = fmt_dt(e) if e is not None else None
+        if end == start:
+            end = None
+
+        events[uid] = {
+            "uid": uid,
+            "title": title,
+            "start": start,
+            "end": end,
+            "types": determine_types(title),
         }
-    }
-    try:
-        response = requests.patch(url, headers=headers, json=data)
-        response.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        print(f"ALERTA - Erro ao atualizar evento: {e}")
-        return False
-
-def delete_event(page_id, title):
-    url = f"https://api.notion.com/v1/pages/{page_id}"
-    data = {"archived": True}
-    try:
-        response = requests.patch(url, headers=headers, json=data)
-        response.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        print(f"ALERTA - Erro ao eliminar '{title}': {e}")
-        return False
+    return events
 
 
 # --- Sincronização ---
 
-start_time = time.time()
-existing_events = get_existing_events()
-try:
-    ics_response = requests.get(ICAL_URL)
-    ics_response.raise_for_status()
-    cal = Calendar.from_ical(ics_response.text)
-except requests.RequestException as e:
-    logger.error(f"ALERTA - Erro ao recuperar ICS: {e}")
-    exit(1)
-except Exception as e:
-    logger.error(f"ALERTA - Erro ao processar ICS: {e}")
-    exit(1)
+def build_plan(ics_events, pages):
+    """Calcula tudo o que é preciso fazer, sem escrever nada."""
+    by_uid = {}
+    legacy = {}
+    for p in pages:
+        if p["uid"]:
+            by_uid.setdefault(p["uid"], []).append(p)
+        else:
+            legacy_key = f"{normalize_text(p['title'])}__{p['start']}__{p['end']}"
+            legacy.setdefault(legacy_key, []).append(p)
 
-ics_events = {}
+    actions = []  # (tipo, page_id, evento_ou_titulo)
+    unchanged = 0
+    archive = []
 
-for component in cal.walk():
-    if component.name != "VEVENT":
-        continue
-    title = str(component.get("summary"))
-    start = normalize_datetime(component.get("dtstart").dt)
-    
-    # fallback se dtend não existir
-    dtend = component.get("dtend")
-    if dtend is None:
-        end = start  # assume que termina no mesmo instante
-    else:
-        end = normalize_datetime(dtend.dt)
-    
-    types = determine_types(title)
-    key = f"{normalize_text(title)}__{start}__{end}"
-    ics_events[key] = {"title": title, "start": start, "end": end, "types": types}
+    for uid, ev in ics_events.items():
+        candidates = by_uid.pop(uid, [])
 
+        if not candidates:
+            # Tenta adotar uma página antiga (sem UID) com o mesmo título+datas
+            legacy_key = f"{normalize_text(ev['title'])}__{ev['start']}__{ev['end']}"
+            if legacy.get(legacy_key):
+                candidates = [legacy[legacy_key].pop(0)]
 
-# --- Atualizações e Adições ---
+        if not candidates:
+            actions.append(("add", None, ev))
+            continue
 
-added_events = []
-updated_events = []
-deleted_events = []
+        keep, extras = candidates[0], candidates[1:]
+        archive.extend(("archive", p["page_id"], p["title"]) for p in extras)  # duplicados
 
-for key, ics_event in ics_events.items():
-    if key in existing_events:
-        event = existing_events[key]
-        if dates_changed(event["start"], event["end"], ics_event["start"], ics_event["end"]) or types_changed(event["types"], ics_event["types"]):
-            if update_event(event["page_id"], event["title"], event["start"], event["end"], event["types"], ics_event["start"], ics_event["end"], ics_event["types"]):
-                updated_events.append(event["title"])
-    else:
-        if add_event(ics_event["title"], ics_event["start"], ics_event["end"], ics_event["types"]):
-            added_events.append(ics_event["title"])
+        if needs_update(keep, ev):
+            actions.append(("update", keep["page_id"], ev))
+        else:
+            unchanged += 1
+
+    # O que sobrou já não existe no ICS (ou é duplicado antigo sem UID)
+    for group in by_uid.values():
+        archive.extend(("archive", p["page_id"], p["title"]) for p in group)
+    for group in legacy.values():
+        archive.extend(("archive", p["page_id"], p["title"]) for p in group)
+
+    return actions + archive, unchanged
 
 
-# --- Elimina os que já não estão no ICS ---
+def main():
+    t0 = time.time()
 
-for key, event in existing_events.items():
-    if key not in ics_events:
-        if delete_event(event["page_id"], event["title"]):
-            deleted_events.append(event["title"])
+    logger.info("A ler o calendário ICS...")
+    try:
+        ics_events = load_ics_events()
+    except Exception as e:
+        logger.error(f"Erro ao recuperar/processar ICS: {e}")
+        return 1
+    logger.info(f"ICS: {len(ics_events)} eventos.")
 
-end_time = time.time()
-execution_time = end_time - start_time
+    if not ics_events:
+        logger.error("ICS sem eventos; a abortar para não apagar tudo no Notion.")
+        return 1
 
-maintained = len(ics_events) - len(updated_events)
+    logger.info("A ler a base de dados do Notion...")
+    try:
+        check_schema()
+        pages = get_existing_events()
+    except Exception as e:
+        logger.error(f"Erro ao ler o Notion; a abortar sem alterar nada: {e}")
+        return 1
 
-logger.info(f"RESUMO - Mantidos: {maintained} | Atualizados: {len(updated_events)} | Adicionados: {len(added_events)} | Eliminados: {len(deleted_events)} | Tempo: {execution_time:.2f}s")
+    actions, unchanged = build_plan(ics_events, pages)
+    n_add = sum(1 for a in actions if a[0] == "add")
+    n_upd = sum(1 for a in actions if a[0] == "update")
+    n_arc = sum(1 for a in actions if a[0] == "archive")
+    logger.info(
+        f"Plano: {n_add} a adicionar | {n_upd} a atualizar | {n_arc} a arquivar | {unchanged} sem alterações"
+    )
 
-if len(updated_events) > 0 or len(added_events) > 0 or len(deleted_events) > 0:
-    response = input("\nDeseja ver os detalhes das alterações? (s/n): ").strip().lower()
-    if response == 's':
-        if added_events:
-            print(f"\nAdicionados ({len(added_events)}):")
-            for title in added_events:
-                print(f"  - {title}")
-        if updated_events:
-            print(f"\nAtualizados ({len(updated_events)}):")
-            for title in updated_events:
-                print(f"  - {title}")
-        if deleted_events:
-            print(f"\nEliminados ({len(deleted_events)}):")
-            for title in deleted_events:
-                print(f"  - {title}")
-    else:
-        print("Programa terminado.")
-else:
-    logger.info("Nenhuma alteração necessária.")
+    added, updated, deleted, failed = [], [], [], 0
+    labels = {"add": "A adicionar", "update": "A atualizar", "archive": "A arquivar"}
+
+    if actions:
+        with logging_redirect_tqdm():
+            bar = tqdm(actions, unit="ev", ncols=100, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+            for kind, page_id, payload in bar:
+                title = payload["title"] if isinstance(payload, dict) else payload
+                bar.set_description(f"{labels[kind]}: {title[:45]:<45}")
+
+                if kind == "add":
+                    ok = add_event(payload)
+                    if ok:
+                        added.append(title)
+                elif kind == "update":
+                    ok = update_event(page_id, payload)
+                    if ok:
+                        updated.append(title)
+                else:
+                    ok = archive_event(page_id, title)
+                    if ok:
+                        deleted.append(title)
+
+                if not ok:
+                    failed += 1
+                time.sleep(WRITE_DELAY)
+
+    logger.info(
+        f"RESUMO - Mantidos: {unchanged} | Atualizados: {len(updated)} | "
+        f"Adicionados: {len(added)} | Eliminados: {len(deleted)} | "
+        f"Falhados: {failed} | Tempo: {time.time() - t0:.2f}s"
+    )
+    for label, items in (("Adicionados", added), ("Atualizados", updated), ("Eliminados", deleted)):
+        for title in items:
+            logger.info(f"  {label}: {title}")
+
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
